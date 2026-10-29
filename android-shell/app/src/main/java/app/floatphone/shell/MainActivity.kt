@@ -272,6 +272,9 @@ class MainActivity : AppCompatActivity() {
             )
         }
         setContentView(rootContainer)
+                // 本机文件桥：供 float 插件读写 /sdcard/DSH
+        runCatching { FloatFsBridge().start() }
+        if (!FloatFsBridge.hasAllFilesAccess()) runCatching { FloatFsBridge.requestAllFilesAccess(this) }
         // 挂上 insets 监听：状态栏高度注入 + 键盘避让都靠它。必须在 setContentView 之后，
         // 此时 rootContainer 已初始化，监听回调里才能安全地给它设内边距。
         observeWindowInsets()
