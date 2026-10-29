@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  float 的网页是 https origin，本机文件桥走 http://127.0.0.1。
+  Android 默认禁止明文流量（usesCleartextTraffic="false"），
+  这里只对本机回环地址开口子，其余域名仍强制 https。
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>
