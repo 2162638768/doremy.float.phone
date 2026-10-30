@@ -119,6 +119,7 @@ class FloatFsBridge(
             "writeBytes" -> writeBinary(socket, devicePath, target, request)
             "list" -> listDir(socket, devicePath, target)
             "stat" -> statFile(socket, devicePath, target)
+            "trash" -> trashFile(socket, devicePath, target, request)
             else -> reply(socket, 400, error = "UNKNOWN_OP: ${request.optString("op")}")
         }
     }
@@ -237,6 +238,70 @@ class FloatFsBridge(
             put("size", if (target.isDirectory) 0L else target.length())
             put("mtime", target.lastModified())
         }.toString())
+    }
+
+    /**
+     * 删除 = 移到回收站，不真删。
+     * 源必须在工作区内；回收站位置由调用方指定（默认 /sdcard/DeepSeek删除）。
+     */
+    private fun trashFile(socket: Socket, devicePath: String, target: File, request: JSONObject) {
+        if (requireConfirm && !request.optBoolean("confirm", false)) {
+            return reply(socket, 200, error = "CONFIRM_REQUIRED: 删除需要 confirm=true")
+        }
+        if (!target.path.startsWith(workspace.canonicalPath)) {
+            return reply(socket, 200, error = "OUTSIDE_WORKSPACE: 只能删除 ${workspace.absolutePath} 下的内容")
+        }
+        if (!target.exists()) return reply(socket, 200, error = "NOT_FOUND: $devicePath 不存在")
+        if (target.absolutePath == workspace.absolutePath) {
+            return reply(socket, 200, error = "FORBIDDEN: 不能删除工作区根目录")
+        }
+
+        var trashPath = request.optString("trashDir", "/sdcard/DeepSeek删除")
+        if (trashPath.isEmpty()) trashPath = "/sdcard/DeepSeek删除"
+        if (!trashPath.startsWith("/sdcard/")) {
+            return reply(socket, 200, error = "BAD_TRASH: 回收站必须在 /sdcard 下")
+        }
+
+        val trashDir = File(trashPath)
+        if (!trashDir.exists()) {
+            val created = trashDir.mkdirs()
+            if (!created && !trashDir.exists()) {
+                return reply(socket, 200, error = "TRASH_FAILED: 无法创建 $trashPath")
+            }
+        }
+
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+        var destination = File(trashDir, stamp + "_" + target.name)
+        var index = 1
+        while (destination.exists()) {
+            destination = File(trashDir, stamp + "_" + index + "_" + target.name)
+            index += 1
+        }
+
+        val renamed = target.renameTo(destination)
+        if (renamed) {
+            return reply(socket, 200, data = "已移到 " + destination.absolutePath)
+        }
+        if (target.isDirectory) {
+            return reply(socket, 200, error = "TRASH_FAILED: 目录无法跨分区移动")
+        }
+
+        val moved = try {
+            target.copyTo(destination)
+            target.delete()
+            true
+        } catch (error: Throwable) {
+            false
+        }
+        if (!moved) {
+            try {
+                destination.delete()
+            } catch (error: Throwable) {
+                // ignore
+            }
+            return reply(socket, 200, error = "TRASH_FAILED: 移动失败")
+        }
+        reply(socket, 200, data = "已移到 " + destination.absolutePath)
     }
 
     private fun readHeaders(input: InputStream): ByteArray? {
