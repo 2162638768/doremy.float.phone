@@ -6,7 +6,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.Settings
+import android.util.Base64
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -38,6 +40,7 @@ class FloatFsBridge(
 ) {
     private val denyNames = setOf(".dsh", ".ssh", ".android")
     private val maxReadBytes = 8L * 1024 * 1024
+    private val maxBinaryBytes = 6L * 1024 * 1024
 
     private val workspace: File by lazy {
         File(Environment.getExternalStorageDirectory(), "DSH").also { it.mkdirs() }
@@ -50,7 +53,9 @@ class FloatFsBridge(
                     Log.i(TAG, "listening on 127.0.0.1:$port, workspace=${workspace.absolutePath}")
                     while (!server.isClosed) {
                         val socket = runCatching { server.accept() }.getOrNull() ?: break
-                        socket.use { handle(it) }
+                        // 单个请求出错不能拖垮整个桥：包一层，记日志后继续服务
+                        runCatching { socket.use { handle(it) } }
+                            .onFailure { Log.e(TAG, "request failed", it) }
                     }
                 }
             } catch (error: Throwable) {
@@ -96,6 +101,10 @@ class FloatFsBridge(
             JSONObject(String(bodyBytes, 0, offset, StandardCharsets.UTF_8))
         }.getOrNull() ?: return reply(socket, 400, error = "BAD_JSON")
 
+        // 健康检查：不看 path，放在路径校验之前，用来确认装的是哪个版本
+        val op = request.optString("op")
+        if (op == "ping") return reply(socket, 200, data = "pong-v2")
+
         val devicePath = request.optString("path", "")
         val rejected = rejectReason(devicePath)
         if (rejected != null) return reply(socket, 403, error = rejected)
@@ -106,6 +115,10 @@ class FloatFsBridge(
         when (request.optString("op")) {
             "read" -> readFile(socket, devicePath, target)
             "write" -> writeFile(socket, devicePath, target, request)
+            "readBytes" -> readBinary(socket, devicePath, target)
+            "writeBytes" -> writeBinary(socket, devicePath, target, request)
+            "list" -> listDir(socket, devicePath, target)
+            "stat" -> statFile(socket, devicePath, target)
             else -> reply(socket, 400, error = "UNKNOWN_OP: ${request.optString("op")}")
         }
     }
@@ -156,6 +169,74 @@ class FloatFsBridge(
             return reply(socket, 200, error = "WRITE_FAILED: 无法覆盖 $devicePath")
         }
         reply(socket, 200, data = if (existed) "updated" else "created")
+    }
+
+    /** 读二进制：返回 base64，供插件做图片/附件卡片 */
+    private fun readBinary(socket: Socket, devicePath: String, target: File) {
+        if (!target.exists()) return reply(socket, 200, error = "NOT_FOUND: $devicePath 不存在")
+        if (target.isDirectory) return reply(socket, 200, error = "IS_DIRECTORY: $devicePath 是目录")
+        if (target.length() > maxBinaryBytes) {
+            return reply(socket, 200, error = "TOO_LARGE: ${target.length()} 字节，上限 $maxBinaryBytes")
+        }
+        val bytes = runCatching { target.readBytes() }.getOrElse {
+            return reply(socket, 200, error = "READ_FAILED: ${it.message}")
+        }
+        reply(socket, 200, data = Base64.encodeToString(bytes, Base64.NO_WRAP))
+    }
+
+    /** 写二进制：从 base64 解码后落盘，栅栏与文本写入一致 */
+    private fun writeBinary(socket: Socket, devicePath: String, target: File, request: JSONObject) {
+        if (requireConfirm && !request.optBoolean("confirm", false)) {
+            return reply(socket, 200, error = "CONFIRM_REQUIRED: 写入需要 confirm=true")
+        }
+        if (!target.path.startsWith(workspace.canonicalPath)) {
+            return reply(socket, 200, error = "OUTSIDE_WORKSPACE: 只能写 ${workspace.absolutePath}")
+        }
+        val encoded = request.optString("contentBase64", "")
+        if (encoded.isEmpty()) return reply(socket, 200, error = "BAD_CONTENT: 缺少 contentBase64")
+        val bytes = runCatching { Base64.decode(encoded, Base64.DEFAULT) }.getOrElse {
+            return reply(socket, 200, error = "BAD_BASE64: ${it.message}")
+        }
+
+        val existed = target.exists()
+        target.parentFile?.mkdirs()
+        val temp = File(target.parentFile, ".${target.name}.tmp")
+        runCatching { temp.writeBytes(bytes) }.getOrElse {
+            temp.delete()
+            return reply(socket, 200, error = "WRITE_FAILED: ${it.message}")
+        }
+        if (!temp.renameTo(target)) {
+            temp.delete()
+            return reply(socket, 200, error = "WRITE_FAILED: 无法覆盖 $devicePath")
+        }
+        reply(socket, 200, data = if (existed) "updated" else "created")
+    }
+
+    /** 列出目录（最多 500 项），返回 JSON 数组字符串 */
+    private fun listDir(socket: Socket, devicePath: String, target: File) {
+        if (!target.exists()) return reply(socket, 200, error = "NOT_FOUND: $devicePath 不存在")
+        if (!target.isDirectory) return reply(socket, 200, error = "NOT_DIRECTORY: $devicePath 不是目录")
+
+        val children = runCatching { target.listFiles() }.getOrNull()?.sortedBy { it.name } ?: emptyList()
+        val array = JSONArray()
+        for (child in children.take(500)) {
+            array.put(JSONObject().apply {
+                put("name", child.name)
+                put("type", if (child.isDirectory) "dir" else "file")
+                put("size", if (child.isDirectory) 0L else child.length())
+            })
+        }
+        reply(socket, 200, data = array.toString())
+    }
+
+    /** 文件元信息 */
+    private fun statFile(socket: Socket, devicePath: String, target: File) {
+        if (!target.exists()) return reply(socket, 200, error = "NOT_FOUND: $devicePath 不存在")
+        reply(socket, 200, data = JSONObject().apply {
+            put("type", if (target.isDirectory) "dir" else "file")
+            put("size", if (target.isDirectory) 0L else target.length())
+            put("mtime", target.lastModified())
+        }.toString())
     }
 
     private fun readHeaders(input: InputStream): ByteArray? {
