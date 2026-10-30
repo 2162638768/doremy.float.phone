@@ -127,7 +127,9 @@ class FloatFsBridge(
     /** 返回拒绝原因，允许则返回 null。所有检查都在原生长度上再做一遍。 */
     private fun rejectReason(devicePath: String): String? {
         if (devicePath.isEmpty()) return "BAD_PATH: 缺少 path"
-        if (!devicePath.startsWith("/sdcard/")) return "PATH_NOT_ALLOWED: 只允许 /sdcard/ 下的路径"
+        if (devicePath != "/sdcard" && !devicePath.startsWith("/sdcard/")) {
+            return "PATH_NOT_ALLOWED: 只允许 /sdcard/ 下的路径"
+        }
         if (devicePath.split('/').any { it == ".." }) return "PATH_TRAVERSAL: 路径不能包含 .."
         for (segment in devicePath.split('/')) {
             if (segment.lowercase() in denyNames) return "PATH_DENIED: 凭据目录 \"$segment\" 不允许访问"
@@ -225,6 +227,7 @@ class FloatFsBridge(
                 put("name", child.name)
                 put("type", if (child.isDirectory) "dir" else "file")
                 put("size", if (child.isDirectory) 0L else child.length())
+                put("mtime", child.lastModified())
             })
         }
         reply(socket, 200, data = array.toString())
