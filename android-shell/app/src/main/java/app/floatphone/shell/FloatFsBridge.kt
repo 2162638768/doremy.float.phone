@@ -53,9 +53,16 @@ class FloatFsBridge(
                     Log.i(TAG, "listening on 127.0.0.1:$port, workspace=${workspace.absolutePath}")
                     while (!server.isClosed) {
                         val socket = runCatching { server.accept() }.getOrNull() ?: break
-                        // 单个请求出错不能拖垮整个桥：包一层，记日志后继续服务
-                        runCatching { socket.use { handle(it) } }
-                            .onFailure { Log.e(TAG, "request failed", it) }
+                        // 每个连接一个线程：浏览器、插件、宿主自己的请求并发时不会互相堵住
+                        runCatching {
+                            thread(isDaemon = true, name = "ffs-conn") {
+                                runCatching { socket.use { handle(it) } }
+                                    .onFailure { Log.e(TAG, "request failed", it) }
+                            }
+                        }.onFailure {
+                            Log.e(TAG, "spawn failed", it)
+                            runCatching { socket.close() }
+                        }
                     }
                 }
             } catch (error: Throwable) {
